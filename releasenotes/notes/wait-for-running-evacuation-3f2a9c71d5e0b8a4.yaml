@@ -7,8 +7,12 @@ fixes:
     the second evacuation concurrently with the first, leaving volume
     attachments and port bindings behind, possibly on another host. An
     evacuation is now waited for while the instance is in a rebuild task
-    state, its newest evacuation migration is accepted, pre-migrating or
-    migrating, and its destination compute, when known, is up.
+    state and any of its evacuation migrations is accepted, pre-migrating or
+    migrating with its destination compute, when known, up. All of them are
+    looked at, not only the newest: a compute driver may refuse a duplicate
+    evacuation and mark only the duplicate's migration failed while the
+    first still runs. Whether the evacuation waited for succeeded is then
+    judged by its own migration.
 upgrade:
   - |
     The new ``evacuation_in_progress_timeout`` option (default 3600 seconds,

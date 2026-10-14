@@ -174,12 +174,12 @@ class EvacuateInstancesTask(base.MasakariTask):
 
         return (old_vm_state, new_vm_state, instance_host)
 
-    def _newest_evacuation(self, context, instance_uuid):
-        """Return the most recent evacuation migration of an instance."""
+    def _evacuations(self, context, instance_uuid):
+        """Return the evacuation migrations of an instance, newest first."""
         migrations = self.novaclient.get_evacuations(context, instance_uuid)
-        if not migrations:
-            return None
-        return max(migrations, key=lambda migration: migration.created_at)
+        return sorted(migrations or [],
+                      key=lambda migration: migration.created_at,
+                      reverse=True)
 
     @staticmethod
     def _running_evacuation_limit():
@@ -220,8 +220,17 @@ class EvacuateInstancesTask(base.MasakariTask):
         or that started more than the limit ago, is taken as dead. One
         whose destination died and is up again cannot be told from one
         still running, since Nova reports no start time for a service; it
-        is waited for until the limit. Returns None when nothing is
-        running, and the instance is then reset and evacuated as before.
+        is waited for until the limit.
+
+        Every evacuation migration of the instance is looked at, not only
+        the newest: a compute driver may refuse a duplicate evacuation of an
+        instance it is already evacuating and mark only the duplicate's
+        migration failed, so the newest one can be failed while an older
+        one still runs.
+
+        Returns the running migration and why it counts as running, or None
+        when nothing is running, and the instance is then reset and
+        evacuated as before.
         """
         limit = self._running_evacuation_limit()
         if not limit:
@@ -229,34 +238,37 @@ class EvacuateInstancesTask(base.MasakariTask):
         task_state = getattr(instance, "OS-EXT-STS:task_state")
         if task_state not in REBUILD_TASK_STATES:
             return None
-        newest = self._newest_evacuation(context, instance.id)
-        if newest is None or newest.status not in EVACUATION_RUNNING:
-            return None
-        started = timeutils.normalize_time(
-            timeutils.parse_isotime(newest.created_at))
-        age = (timeutils.utcnow() - started).total_seconds()
-        dest = getattr(newest, 'dest_compute', None)
-        if dest and not self.novaclient.is_compute_service_up(context, dest):
-            LOG.warning("Evacuation migration %(migration)s of instance "
-                        "%(uuid)s is still '%(status)s', but its "
-                        "destination %(dest)s is down; taking it as dead "
-                        "and evacuating again.",
-                        {'migration': newest.id, 'uuid': instance.id,
-                         'status': newest.status, 'dest': dest})
-            return None
-        if age >= limit:
-            LOG.warning("Evacuation migration %(migration)s of instance "
-                        "%(uuid)s started %(age)d seconds ago and is still "
-                        "'%(status)s' with task state %(task_state)s; "
-                        "taking it as dead and evacuating again.",
-                        {'migration': newest.id, 'uuid': instance.id,
-                         'age': age, 'status': newest.status,
-                         'task_state': task_state})
-            return None
-        return ("evacuation migration %(migration)s started %(age)d "
+        for migration in self._evacuations(context, instance.id):
+            if migration.status not in EVACUATION_RUNNING:
+                continue
+            started = timeutils.normalize_time(
+                timeutils.parse_isotime(migration.created_at))
+            age = (timeutils.utcnow() - started).total_seconds()
+            dest = getattr(migration, 'dest_compute', None)
+            if dest and not self.novaclient.is_compute_service_up(context,
+                                                                  dest):
+                LOG.warning("Evacuation migration %(migration)s of instance "
+                            "%(uuid)s is still '%(status)s', but its "
+                            "destination %(dest)s is down; taking it as "
+                            "dead.",
+                            {'migration': migration.id, 'uuid': instance.id,
+                             'status': migration.status, 'dest': dest})
+                continue
+            if age >= limit:
+                LOG.warning("Evacuation migration %(migration)s of instance "
+                            "%(uuid)s started %(age)d seconds ago and is "
+                            "still '%(status)s' with task state "
+                            "%(task_state)s; taking it as dead.",
+                            {'migration': migration.id, 'uuid': instance.id,
+                             'age': age, 'status': migration.status,
+                             'task_state': task_state})
+                continue
+            return migration, (
+                "evacuation migration %(migration)s started %(age)d "
                 "seconds ago is '%(status)s', task state %(task_state)s"
-                % {'migration': newest.id, 'age': age,
-                   'status': newest.status, 'task_state': task_state})
+                % {'migration': migration.id, 'age': age,
+                   'status': migration.status, 'task_state': task_state})
+        return None
 
     def _stop_after_evacuation(self, context, instance):
         def _wait_for_stop_confirmation():
@@ -319,28 +331,31 @@ class EvacuateInstancesTask(base.MasakariTask):
                         old_vm_state == new_vm_state):
                     raise loopingcall.LoopingCallDone()
 
-        def _wait_for_running_evacuation_confirmation():
+        def _wait_for_running_evacuation_confirmation(migration_id):
             # The evacuation was started by an earlier run, which captured
             # nothing this one can trust about the instance before it. Wait
-            # until Nova is done with it, then judge it the usual way.
+            # until Nova is done with it, then judge it the usual way. Only
+            # the migration waited for tells how it ended: a newer one may
+            # be a duplicate the compute refused and marked failed.
             current = self.novaclient.get_server(context, instance.id)
             if (getattr(current, "OS-EXT-STS:task_state") in
                     REBUILD_TASK_STATES):
                 return
-            newest = self._newest_evacuation(context, instance.id)
-            if newest is not None:
-                if newest.status in EVACUATION_RUNNING:
+            for migration in self._evacuations(context, instance.id):
+                if migration.id != migration_id:
+                    continue
+                if migration.status in EVACUATION_RUNNING:
                     return
-                if newest.status in EVACUATION_FAILED:
+                if migration.status in EVACUATION_FAILED:
                     raise exception.InstanceEvacuateFailed(
                         instance_uuid=instance.id)
             _wait_for_evacuation_confirmation()
 
-        def _wait_for_evacuation(confirm=None):
+        def _wait_for_evacuation(confirm=None, *args):
             try:
                 # add a timeout to the periodic call.
                 timer = loopingcall.FixedIntervalWithTimeoutLoopingCall(
-                    confirm or _wait_for_evacuation_confirmation)
+                    confirm or _wait_for_evacuation_confirmation, *args)
                 timer.start(interval=CONF.verify_interval,
                             timeout=CONF.wait_period_after_evacuation).wait()
             except loopingcall.LoopingCallTimeOut:
@@ -377,16 +392,17 @@ class EvacuateInstancesTask(base.MasakariTask):
                 # run timed out while Nova kept evacuating. Resetting the
                 # instance and evacuating it again would run a second
                 # evacuation alongside the first, possibly to another host.
+                migration, why = running
                 LOG.info("Instance %(uuid)s is already being evacuated "
                          "(%(why)s); waiting for that evacuation instead of "
                          "starting another.",
-                         {'uuid': instance.id, 'why': running})
+                         {'uuid': instance.id, 'why': why})
                 _update_vmove(
                     vmove,
                     status=fields.VMoveStatus.ONGOING,
                     start_time=timeutils.utcnow())
                 _wait_for_evacuation(
-                    _wait_for_running_evacuation_confirmation)
+                    _wait_for_running_evacuation_confirmation, migration.id)
                 # Unlike below, nothing is stopped or reset afterwards: the
                 # state the instance had before the failure was known only
                 # to the run that started the evacuation.

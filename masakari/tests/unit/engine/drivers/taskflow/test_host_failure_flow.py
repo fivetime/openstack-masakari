@@ -1025,11 +1025,12 @@ class EvacuationInProgressTestCase(base.TestCase):
             id=uuids.instance, host=self.source, vm_state=vm_state,
             task_state='rebuilding', ha_enabled=True)
 
-    def _finish_after(self, server, polls, status='done'):
+    def _finish_after(self, server, polls, status='done', migration=None):
         """Let Nova finish the evacuation after a few polls."""
         real_get = self.fake_client.servers.get
-        migration = self.fake_client.migrations.list(
-            instance_uuid=server.id)[-1]
+        if migration is None:
+            migration = self.fake_client.migrations.list(
+                instance_uuid=server.id)[-1]
         count = {'polls': 0}
 
         def get(id):
@@ -1183,6 +1184,93 @@ class EvacuationInProgressTestCase(base.TestCase):
 
         self.assertEqual(fields.VMoveStatus.SUCCEEDED, vmove.status)
         self.assertEqual([], self.fake_client.servers.evacuate_calls)
+
+    def test_a_refused_duplicate_does_not_end_the_running_evacuation(
+            self, mock_novaclient, mock_unlock, mock_lock):
+        # The destination refused a second evacuation of the instance it is
+        # evacuating and marked only that one's migration failed: the newest
+        # migration is failed while the older one still runs.
+        mock_novaclient.return_value = self.fake_client
+        server = self._rebuilding()
+        self.fake_client.services.create(
+            1, host=self.target, binary='nova-compute', state='up')
+        running = self.fake_client.migrations.create(
+            1, server.id, 'pre-migrating', self._ago(60),
+            dest_compute=self.target)
+        self.fake_client.migrations.create(
+            2, server.id, 'failed', self._ago(30), dest_compute=self.target)
+        self._finish_after(server, polls=3, migration=running)
+        vmove = self._vmove(server.id)
+
+        self.task._evacuate_and_confirm(self.ctxt, vmove)
+
+        self.assertEqual(fields.VMoveStatus.SUCCEEDED, vmove.status)
+        self.assertEqual(self.target, vmove.dest_host)
+        self.assertEqual([], self.fake_client.servers.evacuate_calls)
+        self.assertEqual([], self.fake_client.servers.reset_state_calls)
+
+    def test_an_older_running_evacuation_that_fails_is_a_failure(
+            self, mock_novaclient, mock_unlock, mock_lock):
+        mock_novaclient.return_value = self.fake_client
+        server = self._rebuilding()
+        running = self.fake_client.migrations.create(
+            1, server.id, 'pre-migrating', self._ago(60))
+        self.fake_client.migrations.create(
+            2, server.id, 'failed', self._ago(30))
+        self._finish_after(server, polls=2, status='failed',
+                           migration=running)
+        vmove = self._vmove(server.id)
+
+        self.task._evacuate_and_confirm(self.ctxt, vmove)
+
+        self.assertEqual(fields.VMoveStatus.FAILED, vmove.status)
+        self.assertEqual([], self.fake_client.servers.evacuate_calls)
+        self.assertEqual([], self.fake_client.servers.reset_state_calls)
+
+    def test_a_live_evacuation_behind_a_dead_one_is_waited_for(
+            self, mock_novaclient, mock_unlock, mock_lock):
+        # The newest running migration's destination is down, an older one
+        # to a live destination still runs.
+        mock_novaclient.return_value = self.fake_client
+        server = self._rebuilding()
+        self.fake_client.services.create(
+            1, host='dead-dest', binary='nova-compute', state='down')
+        self.fake_client.services.create(
+            2, host=self.target, binary='nova-compute', state='up')
+        running = self.fake_client.migrations.create(
+            1, server.id, 'pre-migrating', self._ago(60),
+            dest_compute=self.target)
+        self.fake_client.migrations.create(
+            2, server.id, 'pre-migrating', self._ago(30),
+            dest_compute='dead-dest')
+        self._finish_after(server, polls=2, migration=running)
+        vmove = self._vmove(server.id)
+
+        self.task._evacuate_and_confirm(self.ctxt, vmove)
+
+        self.assertEqual(fields.VMoveStatus.SUCCEEDED, vmove.status)
+        self.assertEqual([], self.fake_client.servers.evacuate_calls)
+        self.assertEqual([], self.fake_client.servers.reset_state_calls)
+
+    def test_no_live_evacuation_among_several_is_a_dead_evacuation(
+            self, mock_novaclient, mock_unlock, mock_lock):
+        mock_novaclient.return_value = self.fake_client
+        server = self._rebuilding()
+        self.fake_client.services.create(
+            1, host='dead-dest', binary='nova-compute', state='down')
+        self.fake_client.migrations.create(
+            1, server.id, 'pre-migrating', self._ago(601))
+        self.fake_client.migrations.create(
+            2, server.id, 'pre-migrating', self._ago(60),
+            dest_compute='dead-dest')
+        self.fake_client.migrations.create(
+            3, server.id, 'failed', self._ago(30))
+        vmove = self._vmove(server.id)
+
+        self.task._evacuate_and_confirm(self.ctxt, vmove)
+
+        self.assertEqual(1, len(self.fake_client.servers.reset_state_calls))
+        self.assertEqual(1, len(self.fake_client.servers.evacuate_calls))
 
     def test_a_running_migration_alone_is_not_a_running_evacuation(
             self, mock_novaclient, mock_unlock, mock_lock):
