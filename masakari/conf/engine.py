@@ -80,22 +80,39 @@ notification_opts = [
                     'timed out wait fails the recovery even though the '
                     'evacuation goes on.'),
     cfg.IntOpt('evacuation_in_progress_timeout',
-               default=600,
+               default=3600,
                min=0,
                help='Seconds after its start during which an evacuation '
-                    'that Nova still reports running (an evacuation '
-                    'migration accepted, pre-migrating or migrating, or a '
-                    'rebuild task state backed by such a migration) is '
-                    'waited for instead of being reset and evacuated '
-                    'again, for example when an unfinished notification '
-                    'is processed again. Nova runs a second evacuation of '
-                    'the same instance concurrently with the first, which '
-                    'leaves volume attachments and port bindings behind. '
-                    'An evacuation older than this is taken as dead, '
-                    'since one whose destination compute died is never '
-                    'marked failed, and the instance is reset and '
-                    'evacuated again as before. Keep it above the longest '
-                    'evacuation expected. 0 never waits.'),
+                    'Nova still runs is waited for instead of being reset '
+                    'and evacuated again, for example when an unfinished '
+                    'notification is processed again after '
+                    'wait_period_after_evacuation ran out. Nova runs a '
+                    'second evacuation of the same instance concurrently '
+                    'with the first, which leaves volume attachments and '
+                    'port bindings behind. An evacuation counts as running '
+                    'when the instance is in a rebuild task state and its '
+                    'newest evacuation migration is accepted, '
+                    'pre-migrating or migrating, and its destination '
+                    'compute, when known, is up. One whose destination '
+                    'compute is down, or older than this, is taken as dead '
+                    'and the instance is reset and evacuated again as '
+                    'before. A destination compute killed mid-evacuation '
+                    'and started again leaves the instance in a rebuild '
+                    'task state, with the failed host as its host and the '
+                    'migration pre-migrating: once that compute is up '
+                    'again, nothing tells it from a running evacuation, '
+                    'and recovery is delayed by up to this limit. This '
+                    'only narrows the window for a second '
+                    'evacuation, it does not close it: an evacuation still '
+                    'running past this is evacuated again. A value below '
+                    'wait_period_after_evacuation + '
+                    'process_unfinished_notifications_interval + '
+                    'wait_period_after_service_update, the earliest a '
+                    'second run can look at it, is raised to that sum. '
+                    'With more instances to evacuate than '
+                    'host_failure_recovery_threads, each further batch '
+                    'adds up to wait_period_after_evacuation before a '
+                    'second run; raise it accordingly. 0 never waits.'),
     cfg.IntOpt('verify_interval',
                default=1,
                help='The monitoring interval for looping'),

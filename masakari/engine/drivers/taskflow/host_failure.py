@@ -181,33 +181,69 @@ class EvacuateInstancesTask(base.MasakariTask):
             return None
         return max(migrations, key=lambda migration: migration.created_at)
 
+    @staticmethod
+    def _running_evacuation_limit():
+        """Seconds an evacuation may run before it is taken as dead.
+
+        A second run looks at an evacuation no earlier than the first run's
+        wait for it, plus the time until the periodic task picks the
+        notification up again, plus the wait after disabling the compute
+        service that starts every run. A limit below that would take every
+        evacuation the first run timed out on as dead.
+        """
+        limit = CONF.evacuation_in_progress_timeout
+        if limit <= 0:
+            return 0
+        floor = (CONF.wait_period_after_evacuation +
+                 CONF.process_unfinished_notifications_interval +
+                 CONF.wait_period_after_service_update)
+        if limit < floor:
+            LOG.warning("evacuation_in_progress_timeout %(limit)d is below "
+                        "%(floor)d, the earliest a second run can look at "
+                        "an evacuation; using %(floor)d.",
+                        {'limit': limit, 'floor': floor})
+            return floor
+        return limit
+
     def _running_evacuation(self, context, instance):
         """Return why an evacuation of the instance is still running.
 
         Nova does not refuse a second evacuation while one is running, and
         the two then race on the destination: volume attachments and port
-        bindings of the loser are left behind. An evacuation counts as
-        running when its migration record says so, or when the instance's
-        task state is a rebuild one and the newest evacuation migration
-        started recently. Either signal lasts forever when the destination
-        compute dies mid-evacuation, as the migration is never moved to
-        'failed', so only an evacuation started less than
-        evacuation_in_progress_timeout ago counts. Returns None when there is
-        none, and the evacuation is then reset and run again as before.
+        bindings of the loser are left behind. Nova's API sets a rebuild
+        task state and creates an accepted evacuation migration together,
+        so a running evacuation shows both. Both stay for ever when the
+        destination compute dies mid-evacuation: the migration is never
+        moved to 'failed', and as the instance's host is still the failed
+        one, the destination's init_host leaves the instance alone when it
+        starts again. So an evacuation whose destination compute is down,
+        or that started more than the limit ago, is taken as dead. One
+        whose destination died and is up again cannot be told from one
+        still running, since Nova reports no start time for a service; it
+        is waited for until the limit. Returns None when nothing is
+        running, and the instance is then reset and evacuated as before.
         """
-        limit = CONF.evacuation_in_progress_timeout
-        if limit <= 0:
-            return None
-        newest = self._newest_evacuation(context, instance.id)
-        if newest is None:
+        limit = self._running_evacuation_limit()
+        if not limit:
             return None
         task_state = getattr(instance, "OS-EXT-STS:task_state")
-        if (newest.status not in EVACUATION_RUNNING and
-                task_state not in REBUILD_TASK_STATES):
+        if task_state not in REBUILD_TASK_STATES:
+            return None
+        newest = self._newest_evacuation(context, instance.id)
+        if newest is None or newest.status not in EVACUATION_RUNNING:
             return None
         started = timeutils.normalize_time(
             timeutils.parse_isotime(newest.created_at))
         age = (timeutils.utcnow() - started).total_seconds()
+        dest = getattr(newest, 'dest_compute', None)
+        if dest and not self.novaclient.is_compute_service_up(context, dest):
+            LOG.warning("Evacuation migration %(migration)s of instance "
+                        "%(uuid)s is still '%(status)s', but its "
+                        "destination %(dest)s is down; taking it as dead "
+                        "and evacuating again.",
+                        {'migration': newest.id, 'uuid': instance.id,
+                         'status': newest.status, 'dest': dest})
+            return None
         if age >= limit:
             LOG.warning("Evacuation migration %(migration)s of instance "
                         "%(uuid)s started %(age)d seconds ago and is still "

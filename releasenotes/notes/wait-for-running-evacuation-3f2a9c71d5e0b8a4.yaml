@@ -6,10 +6,24 @@ fixes:
     processed again after ``wait_period_after_evacuation`` ran out. Nova runs
     the second evacuation concurrently with the first, leaving volume
     attachments and port bindings behind, possibly on another host. An
-    evacuation migration that is accepted, pre-migrating or migrating, or a
-    rebuild task state backed by an evacuation migration, is now waited for.
-    Since an evacuation whose destination compute died is never marked
-    failed, one started more than the new ``evacuation_in_progress_timeout``
-    seconds ago (default 600, 0 disables the wait) is taken as dead and the
-    instance is evacuated again as before. Where evacuations take long, also
-    raise ``wait_period_after_evacuation``.
+    evacuation is now waited for while the instance is in a rebuild task
+    state, its newest evacuation migration is accepted, pre-migrating or
+    migrating, and its destination compute, when known, is up.
+upgrade:
+  - |
+    The new ``evacuation_in_progress_timeout`` option (default 3600 seconds,
+    0 disables the wait) bounds how long an evacuation counts as running,
+    since one whose destination compute died is never marked failed. It is
+    raised to ``wait_period_after_evacuation`` +
+    ``process_unfinished_notifications_interval`` +
+    ``wait_period_after_service_update`` when set below that.
+    A destination compute killed mid-evacuation and started again leaves the
+    instance in a rebuild task state, with the failed host as its host and
+    the migration pre-migrating, because its ``init_host`` only handles
+    instances whose host is its own. Once that compute is up again, nothing
+    tells the evacuation from a running one, as Nova reports no start time
+    for a service, and its recovery is delayed by up to the limit. A
+    destination compute that is down or forced down ends the wait at once.
+    The wait only narrows the window for a second evacuation: an evacuation
+    still running past the limit is evacuated again. Where evacuations take
+    long, raise ``wait_period_after_evacuation`` as well.

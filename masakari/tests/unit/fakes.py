@@ -116,8 +116,9 @@ class FakeNovaClient(object):
 
     class Migration(object):
         def __init__(self, id, instance_uuid, status, created_at,
-                     migration_type='evacuation'):
+                     migration_type='evacuation', dest_compute=None):
             self.id = id
+            self.dest_compute = dest_compute
             self.instance_uuid = instance_uuid
             self.status = status
             self.created_at = created_at
@@ -128,10 +129,10 @@ class FakeNovaClient(object):
             self._migrations = []
 
         def create(self, id, instance_uuid, status, created_at,
-                   migration_type='evacuation'):
+                   migration_type='evacuation', dest_compute=None):
             migration = FakeNovaClient.Migration(
                 id, instance_uuid, status, created_at,
-                migration_type=migration_type)
+                migration_type=migration_type, dest_compute=dest_compute)
             self._migrations.append(migration)
             return migration
 
@@ -171,21 +172,24 @@ class FakeNovaClient(object):
                     return aggregate
 
     class Service(object):
-        def __init__(self, id=None, host=None, binary=None, status='enabled'):
+        def __init__(self, id=None, host=None, binary=None, status='enabled',
+                     state='up', forced_down=False):
             self.id = id
             self.host = host
             self.binary = binary
             self.status = status
+            self.state = state
+            self.forced_down = forced_down
 
     class Services(object):
         def __init__(self):
             self._services = []
 
         def create(self, id, host=None, binary=None,
-                   status=None):
-            self._services.append(FakeNovaClient.Service(id=id, host=host,
-                                                         binary=binary,
-                                                         status=status))
+                   status=None, state='up', forced_down=False):
+            self._services.append(FakeNovaClient.Service(
+                id=id, host=host, binary=binary, status=status,
+                state=state, forced_down=forced_down))
 
         def disable(self, service_id):
             for _service in self._services:

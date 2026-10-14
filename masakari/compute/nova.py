@@ -179,6 +179,15 @@ class API(object):
         return service.status == 'disabled'
 
     @translate_nova_exception
+    def is_compute_service_up(self, context, host_name):
+        """Whether Nova sees the nova-compute of a host alive."""
+        nova = novaclient(context)
+        services = nova.services.list(host=host_name, binary='nova-compute')
+        return any(service.state == 'up' and
+                   not getattr(service, 'forced_down', False)
+                   for service in services)
+
+    @translate_nova_exception
     def evacuate_instance(self, context, uuid, target=None):
         """Evacuate an instance from failed host to specified host."""
         msg = ('Call evacuate command for instance %(uuid)s on host '

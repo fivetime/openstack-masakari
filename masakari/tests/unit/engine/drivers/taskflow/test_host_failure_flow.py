@@ -1150,3 +1150,83 @@ class EvacuationInProgressTestCase(base.TestCase):
 
         self.assertEqual(1, len(self.fake_client.servers.reset_state_calls))
         self.assertEqual(1, len(self.fake_client.servers.evacuate_calls))
+
+    def test_a_dead_destination_is_a_dead_evacuation(
+            self, mock_novaclient, mock_unlock, mock_lock):
+        mock_novaclient.return_value = self.fake_client
+        server = self._rebuilding()
+        self.fake_client.services.create(
+            1, host='dead-dest', binary='nova-compute', state='down')
+        self.fake_client.migrations.create(
+            1, server.id, 'pre-migrating', self._ago(30),
+            dest_compute='dead-dest')
+        vmove = self._vmove(server.id)
+
+        self.task._evacuate_and_confirm(self.ctxt, vmove)
+
+        self.assertEqual(1, len(self.fake_client.servers.reset_state_calls))
+        self.assertEqual(1, len(self.fake_client.servers.evacuate_calls))
+
+    def test_a_live_destination_is_waited_for(
+            self, mock_novaclient, mock_unlock, mock_lock):
+        mock_novaclient.return_value = self.fake_client
+        server = self._rebuilding()
+        self.fake_client.services.create(
+            1, host=self.target, binary='nova-compute', state='up')
+        self.fake_client.migrations.create(
+            1, server.id, 'pre-migrating', self._ago(30),
+            dest_compute=self.target)
+        self._finish_after(server, polls=2)
+        vmove = self._vmove(server.id)
+
+        self.task._evacuate_and_confirm(self.ctxt, vmove)
+
+        self.assertEqual(fields.VMoveStatus.SUCCEEDED, vmove.status)
+        self.assertEqual([], self.fake_client.servers.evacuate_calls)
+
+    def test_a_running_migration_alone_is_not_a_running_evacuation(
+            self, mock_novaclient, mock_unlock, mock_lock):
+        # A migration still marked running without the rebuild task state
+        # that a running evacuation also has is not waited for.
+        mock_novaclient.return_value = self.fake_client
+        server = self.fake_client.servers.create(
+            id=uuids.instance, host=self.source, vm_state='error',
+            ha_enabled=True)
+        self.fake_client.migrations.create(
+            1, server.id, 'pre-migrating', self._ago(30))
+        vmove = self._vmove(server.id)
+
+        self.task._evacuate_and_confirm(self.ctxt, vmove)
+
+        self.assertEqual(1, len(self.fake_client.servers.evacuate_calls))
+
+    def test_a_limit_a_second_run_cannot_reach_is_raised(
+            self, mock_novaclient, mock_unlock, mock_lock):
+        # wait_period_after_evacuation raised to the limit: the second run
+        # looks at the evacuation only after 600 + 120 + 180 seconds.
+        self.override_config("wait_period_after_evacuation", 600)
+        self.override_config("evacuation_in_progress_timeout", 600)
+        mock_novaclient.return_value = self.fake_client
+        server = self._rebuilding()
+        self.fake_client.migrations.create(
+            1, server.id, 'pre-migrating', self._ago(700))
+        self._finish_after(server, polls=2)
+        vmove = self._vmove(server.id)
+
+        self.task._evacuate_and_confirm(self.ctxt, vmove)
+
+        self.assertEqual(fields.VMoveStatus.SUCCEEDED, vmove.status)
+        self.assertEqual([], self.fake_client.servers.evacuate_calls)
+
+    def test_the_limit(self, mock_novaclient, mock_unlock, mock_lock):
+        self.override_config("wait_period_after_evacuation", 600)
+        self.override_config("process_unfinished_notifications_interval",
+                             120)
+        self.override_config("wait_period_after_service_update", 180)
+        limit = host_failure.EvacuateInstancesTask._running_evacuation_limit
+        self.override_config("evacuation_in_progress_timeout", 600)
+        self.assertEqual(900, limit())
+        self.override_config("evacuation_in_progress_timeout", 3600)
+        self.assertEqual(3600, limit())
+        self.override_config("evacuation_in_progress_timeout", 0)
+        self.assertEqual(0, limit())
