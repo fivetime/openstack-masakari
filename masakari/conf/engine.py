@@ -74,7 +74,28 @@ notification_opts = [
                     'or disabled.'),
     cfg.IntOpt('wait_period_after_evacuation',
                default=90,
-               help='Wait until instance is evacuated'),
+               help='Wait until instance is evacuated. Raise it where an '
+                    'evacuation takes longer than that, for example when '
+                    'the destination has to download the image first: a '
+                    'timed out wait fails the recovery even though the '
+                    'evacuation goes on.'),
+    cfg.IntOpt('evacuation_in_progress_timeout',
+               default=600,
+               min=0,
+               help='Seconds after its start during which an evacuation '
+                    'that Nova still reports running (an evacuation '
+                    'migration accepted, pre-migrating or migrating, or a '
+                    'rebuild task state backed by such a migration) is '
+                    'waited for instead of being reset and evacuated '
+                    'again, for example when an unfinished notification '
+                    'is processed again. Nova runs a second evacuation of '
+                    'the same instance concurrently with the first, which '
+                    'leaves volume attachments and port bindings behind. '
+                    'An evacuation older than this is taken as dead, '
+                    'since one whose destination compute died is never '
+                    'marked failed, and the instance is reset and '
+                    'evacuated again as before. Keep it above the longest '
+                    'evacuation expected. 0 never waits.'),
     cfg.IntOpt('verify_interval',
                default=1,
                help='The monitoring interval for looping'),

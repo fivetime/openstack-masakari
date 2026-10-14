@@ -188,6 +188,13 @@ class API(object):
         nova.servers.evacuate(uuid, host=target)
 
     @translate_nova_exception
+    def get_evacuations(self, context, uuid):
+        """Return the evacuation migration records of an instance."""
+        nova = novaclient(context)
+        return nova.migrations.list(instance_uuid=uuid,
+                                    migration_type='evacuation')
+
+    @translate_nova_exception
     def reset_instance_state(self, context, uuid, status='error'):
         """Reset the state of an instance to active or error."""
         msg = ('Call reset state command on instance %(uuid)s to '

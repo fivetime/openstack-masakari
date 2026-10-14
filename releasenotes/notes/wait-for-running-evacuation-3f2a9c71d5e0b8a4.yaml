@@ -1,0 +1,15 @@
+---
+fixes:
+  - |
+    Host failure recovery no longer evacuates an instance a second time while
+    Nova is still evacuating it, which happened when a notification was
+    processed again after ``wait_period_after_evacuation`` ran out. Nova runs
+    the second evacuation concurrently with the first, leaving volume
+    attachments and port bindings behind, possibly on another host. An
+    evacuation migration that is accepted, pre-migrating or migrating, or a
+    rebuild task state backed by an evacuation migration, is now waited for.
+    Since an evacuation whose destination compute died is never marked
+    failed, one started more than the new ``evacuation_in_progress_timeout``
+    seconds ago (default 600, 0 disables the wait) is taken as dead and the
+    instance is evacuated again as before. Where evacuations take long, also
+    raise ``wait_period_after_evacuation``.

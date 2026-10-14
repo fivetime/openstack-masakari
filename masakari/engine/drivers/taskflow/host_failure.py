@@ -38,6 +38,13 @@ LOG = logging.getLogger(__name__)
 ACTION = 'instance:evacuate'
 # Instance power_state
 SHUTDOWN = 4
+# Task states of an instance whose rebuild, which is how Nova evacuates, is
+# under way.
+REBUILD_TASK_STATES = ('rebuilding', 'rebuild_block_device_mapping',
+                       'rebuild_spawning')
+# Statuses of an evacuation migration that has neither finished nor failed.
+EVACUATION_RUNNING = ('accepted', 'pre-migrating', 'migrating')
+EVACUATION_FAILED = ('failed', 'error')
 TASKFLOW_CONF = cfg.CONF.taskflow_driver_recovery_flows
 
 
@@ -167,6 +174,54 @@ class EvacuateInstancesTask(base.MasakariTask):
 
         return (old_vm_state, new_vm_state, instance_host)
 
+    def _newest_evacuation(self, context, instance_uuid):
+        """Return the most recent evacuation migration of an instance."""
+        migrations = self.novaclient.get_evacuations(context, instance_uuid)
+        if not migrations:
+            return None
+        return max(migrations, key=lambda migration: migration.created_at)
+
+    def _running_evacuation(self, context, instance):
+        """Return why an evacuation of the instance is still running.
+
+        Nova does not refuse a second evacuation while one is running, and
+        the two then race on the destination: volume attachments and port
+        bindings of the loser are left behind. An evacuation counts as
+        running when its migration record says so, or when the instance's
+        task state is a rebuild one and the newest evacuation migration
+        started recently. Either signal lasts forever when the destination
+        compute dies mid-evacuation, as the migration is never moved to
+        'failed', so only an evacuation started less than
+        evacuation_in_progress_timeout ago counts. Returns None when there is
+        none, and the evacuation is then reset and run again as before.
+        """
+        limit = CONF.evacuation_in_progress_timeout
+        if limit <= 0:
+            return None
+        newest = self._newest_evacuation(context, instance.id)
+        if newest is None:
+            return None
+        task_state = getattr(instance, "OS-EXT-STS:task_state")
+        if (newest.status not in EVACUATION_RUNNING and
+                task_state not in REBUILD_TASK_STATES):
+            return None
+        started = timeutils.normalize_time(
+            timeutils.parse_isotime(newest.created_at))
+        age = (timeutils.utcnow() - started).total_seconds()
+        if age >= limit:
+            LOG.warning("Evacuation migration %(migration)s of instance "
+                        "%(uuid)s started %(age)d seconds ago and is still "
+                        "'%(status)s' with task state %(task_state)s; "
+                        "taking it as dead and evacuating again.",
+                        {'migration': newest.id, 'uuid': instance.id,
+                         'age': age, 'status': newest.status,
+                         'task_state': task_state})
+            return None
+        return ("evacuation migration %(migration)s started %(age)d "
+                "seconds ago is '%(status)s', task state %(task_state)s"
+                % {'migration': newest.id, 'age': age,
+                   'status': newest.status, 'task_state': task_state})
+
     def _stop_after_evacuation(self, context, instance):
         def _wait_for_stop_confirmation():
             old_vm_state, new_vm_state, instance_host = (
@@ -228,11 +283,28 @@ class EvacuateInstancesTask(base.MasakariTask):
                         old_vm_state == new_vm_state):
                     raise loopingcall.LoopingCallDone()
 
-        def _wait_for_evacuation():
+        def _wait_for_running_evacuation_confirmation():
+            # The evacuation was started by an earlier run, which captured
+            # nothing this one can trust about the instance before it. Wait
+            # until Nova is done with it, then judge it the usual way.
+            current = self.novaclient.get_server(context, instance.id)
+            if (getattr(current, "OS-EXT-STS:task_state") in
+                    REBUILD_TASK_STATES):
+                return
+            newest = self._newest_evacuation(context, instance.id)
+            if newest is not None:
+                if newest.status in EVACUATION_RUNNING:
+                    return
+                if newest.status in EVACUATION_FAILED:
+                    raise exception.InstanceEvacuateFailed(
+                        instance_uuid=instance.id)
+            _wait_for_evacuation_confirmation()
+
+        def _wait_for_evacuation(confirm=None):
             try:
                 # add a timeout to the periodic call.
                 timer = loopingcall.FixedIntervalWithTimeoutLoopingCall(
-                    _wait_for_evacuation_confirmation)
+                    confirm or _wait_for_evacuation_confirmation)
                 timer.start(interval=CONF.verify_interval,
                             timeout=CONF.wait_period_after_evacuation).wait()
             except loopingcall.LoopingCallTimeOut:
@@ -262,6 +334,33 @@ class EvacuateInstancesTask(base.MasakariTask):
 
             vm_state = getattr(instance, "OS-EXT-STS:vm_state")
             task_state = getattr(instance, "OS-EXT-STS:task_state")
+
+            running = self._running_evacuation(context, instance)
+            if running:
+                # Typically a notification processed again after an earlier
+                # run timed out while Nova kept evacuating. Resetting the
+                # instance and evacuating it again would run a second
+                # evacuation alongside the first, possibly to another host.
+                LOG.info("Instance %(uuid)s is already being evacuated "
+                         "(%(why)s); waiting for that evacuation instead of "
+                         "starting another.",
+                         {'uuid': instance.id, 'why': running})
+                _update_vmove(
+                    vmove,
+                    status=fields.VMoveStatus.ONGOING,
+                    start_time=timeutils.utcnow())
+                _wait_for_evacuation(
+                    _wait_for_running_evacuation_confirmation)
+                # Unlike below, nothing is stopped or reset afterwards: the
+                # state the instance had before the failure was known only
+                # to the run that started the evacuation.
+                instance = self.novaclient.get_server(context, instance_uuid)
+                _update_vmove(
+                    vmove,
+                    status=fields.VMoveStatus.SUCCEEDED,
+                    dest_host=getattr(
+                        instance, "OS-EXT-SRV-ATTR:hypervisor_hostname"))
+                return
 
             # Nova evacuates an instance only when vm_state is in active,
             # stopped or error state. If an instance is in other than active,

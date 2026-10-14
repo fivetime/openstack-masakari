@@ -57,6 +57,7 @@ class FakeNovaClient(object):
             self._servers = []
             self.reset_state_calls = []
             self.stop_calls = []
+            self.evacuate_calls = []
 
         def create(self, id, uuid=None, host=None, vm_state='active',
                    task_state=None, power_state=1, ha_enabled=False,
@@ -93,6 +94,7 @@ class FakeNovaClient(object):
             setattr(server, 'OS-EXT-STS:vm_state', status)
 
         def evacuate(self, uuid, host=None):
+            self.evacuate_calls.append((uuid, host))
             if not host:
                 host = 'fake-host-1'
             server = self.get(uuid)
@@ -111,6 +113,32 @@ class FakeNovaClient(object):
         def start(self, id):
             server = self.get(id)
             setattr(server, 'OS-EXT-STS:vm_state', 'active')
+
+    class Migration(object):
+        def __init__(self, id, instance_uuid, status, created_at,
+                     migration_type='evacuation'):
+            self.id = id
+            self.instance_uuid = instance_uuid
+            self.status = status
+            self.created_at = created_at
+            self.migration_type = migration_type
+
+    class MigrationManager(object):
+        def __init__(self):
+            self._migrations = []
+
+        def create(self, id, instance_uuid, status, created_at,
+                   migration_type='evacuation'):
+            migration = FakeNovaClient.Migration(
+                id, instance_uuid, status, created_at,
+                migration_type=migration_type)
+            self._migrations.append(migration)
+            return migration
+
+        def list(self, instance_uuid=None, migration_type=None, **kwargs):
+            return [m for m in self._migrations
+                    if instance_uuid in (None, m.instance_uuid) and
+                    migration_type in (None, m.migration_type)]
 
     class Aggregate(object):
         def __init__(self, id=None, uuid=None, name=None, hosts=None):
@@ -183,6 +211,7 @@ class FakeNovaClient(object):
         self.servers = FakeNovaClient.ServerManager()
         self.services = FakeNovaClient.Services()
         self.aggregates = FakeNovaClient.AggregatesManager()
+        self.migrations = FakeNovaClient.MigrationManager()
 
 
 def create_fake_notification(type="VM", id=1, payload=None,
